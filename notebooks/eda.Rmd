@@ -1,0 +1,70 @@
+---
+title: "Exploratory Data Analysis"
+author: "Peter Tran"
+date: "4/23/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+set.seed(04232021)
+
+library(caret)
+library(ggplot2)
+library(glmnet)
+library(glmnetUtils)
+```
+
+```{r}
+if (!exists("expr", inherits=FALSE)) {
+  if (file.exists("../data/processed/expr.Rda")) {
+    load("../data/processed/expr.Rda")
+  } else {
+    expr <- read.csv("../data/raw/Brain_GSE50161.csv")
+    dir.create("../data/processed", showWarnings=FALSE)
+    save(expr, file="../data/processed/expr.Rda")
+  }
+}
+```
+
+```{r}
+head(expr)
+```
+
+```{r}
+class_histogram <- ggplot(expr, aes(type)) + geom_bar(stat="count") + ggtitle("Distribution of Brain Cancer Types") + xlab("Type") + ylab("Count")
+ggsave("../reports/figures/class_histogram.png", class_histogram)
+class_histogram
+```
+
+Looks like the data are imbalanced. The low number of observations for "normal" is concerning.
+
+```{r}
+train_index <- createDataPartition(expr$type, p=0.5, list=FALSE)
+X_train <- data.matrix(expr[train_index,-(1:2)])
+y_train <- expr[train_index,2]
+X_test <- data.matrix(expr[-train_index,-(1:2)])
+y_test <- expr[-train_index,2]
+```
+
+Let's begin with a simple approach, a one-vs-all logistic regression classifier.
+
+```{r}
+types <- unique(expr$type)
+models <- lapply(types, function(type) {
+  y_train_type <- ifelse(y_train == type, 1, 0)
+  model <- cv.glmnet(X_train, y_train_type, family=binomial)
+  return(model)
+})
+```
+
+```{r}
+ova_y_pred <- as.data.frame(predict(models, X_test, type="response"))
+colnames(ova_y_pred) <- types
+y_pred <- colnames(ova_y_pred)[max.col(ova_y_pred, "first")]
+confusionMatrix(as.factor(y_test), as.factor(y_pred))
+```
+
+Very good for a first pass!
