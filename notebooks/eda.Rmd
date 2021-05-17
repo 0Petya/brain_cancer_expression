@@ -12,6 +12,7 @@ knitr::opts_chunk$set(echo = TRUE)
 set.seed(04232021)
 
 library(caret)
+library(e1071)
 library(ggplot2)
 library(glmnet)
 library(glmnetUtils)

@@ -1,0 +1,335 @@
+---
+title: "Model Development"
+author: "Peter Tran"
+date: "5/15/2021"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+set.seed(05142021)
+
+library(ComplexHeatmap)
+library(MASS)
+library(caret)
+library(class)
+library(coefplot)
+library(e1071)
+library(ggfortify)
+library(glmnet)
+library(glmnetUtils)
+library(pROC)
+```
+
+# Data preprocessing
+
+```{r}
+if (!exists("expr", inherits=FALSE)) {
+  if (file.exists("../data/processed/expr.Rda")) {
+    load("../data/processed/expr.Rda")
+  } else {
+    expr <- read.csv("../data/raw/Brain_GSE50161.csv")
+    dir.create("../data/processed", showWarnings=FALSE)
+    save(expr, file="../data/processed/expr.Rda")
+  }
+}
+```
+
+We need train, validation, and test sets. Test set is only run with the final model.
+
+```{r}
+train_index <- createDataPartition(expr$type, p=0.5, list=FALSE)
+X_train <- data.matrix(expr[train_index,-(1:2)])
+y_train <- expr[train_index,2]
+
+non_train_expr <- expr[-train_index,]
+val_index <- createDataPartition(non_train_expr$type, p=0.5, list=FALSE)
+X_val <- data.matrix(non_train_expr[val_index,-(1:2)])
+y_val <- non_train_expr[val_index,2]
+X_test <- data.matrix(non_train_expr[-val_index,-(1:2)])
+y_test <- non_train_expr[-val_index,2]
+```
+
+# Logistic regression
+
+First we need a baseline model to judge performance of. This is a simple one-vs-all logistic regression model with lasso regression using lambda determined by 10-fold cross-validation.
+
+```{r}
+types <- unique(expr$type)
+baseline_models <- lapply(types, function(type) {
+  y_train_type <- ifelse(y_train == type, 1, 0)
+  model <- cv.glmnet(X_train, y_train_type, family=binomial)
+  return(model)
+})
+```
+
+Here's an example of what one of the cross-validation curves looks like for a model (the Ependymoma model).
+
+```{r}
+png("../reports/figures/logistic_regression_cross_validation_example.png")
+plot(baseline_models[[1]])
+invisible(dev.off())
+plot(baseline_models[[1]])
+```
+
+```{r}
+baseline_ova_y_pred <- as.data.frame(predict(baseline_models, X_val, type="response"))
+colnames(baseline_ova_y_pred) <- types
+baseline_roc <- multiclass.roc(as.factor(y_val), baseline_ova_y_pred)
+auc(baseline_roc)
+```
+
+With our baseline model, we get an AUC of 0.8906 on the validation set. How many genes were found to have non-zero coefficients between all 5 models?
+
+```{r}
+baseline_coefs <- unique(do.call(c, lapply(baseline_models, function(model) {
+  coefs <- coef(model, s="lambda.min")
+  variables <- rownames(coefs)[coefs[,1] != 0]
+  return(variables[-1])
+})))
+
+length(baseline_coefs)
+```
+
+That's a much smaller set of genes than what was given to us. Looks like there's a lot of room for variable selection.
+
+Let's try using ridge regression rather than lasso for our regularization.
+
+```{r}
+ridge_models <- lapply(types, function(type) {
+  y_train_type <- ifelse(y_train == type, 1, 0)
+  model <- cv.glmnet(X_train, y_train_type, family=binomial, alpha=0)
+  return(model)
+})
+```
+
+```{r}
+ridge_ova_y_pred <- as.data.frame(predict(ridge_models, X_val, type="response"))
+colnames(ridge_ova_y_pred) <- types
+ridge_roc <- multiclass.roc(as.factor(y_val), ridge_ova_y_pred)
+auc(ridge_roc)
+```
+
+Using ridge regression increases our AUC. However, many variables are included in this model, and most of them will have very little impact on the model. Let's get an idea of what they look like. We'll get the coefficients for all 5 models, get their absolute values (we are only interested in magnitude), and get some descriptive statistics.
+
+```{r}
+summary(do.call(c, lapply(ridge_models, function(model) return(abs(extract.coef(model)["Value"][-1,])))))
+```
+
+Most have extremely small coefficients, and the largest coefficient (excluding the intercept) is still very small when you compare it to what we found with the lasso regression model. While this model may be more powerful, the smaller set of variables needed for the other may make it more useful in practice.
+
+One other popular method of examining the effects of variables is principal component analysis. However our data has many more variables than it has observations. We will reduce the set of variables in the training dataset to the same amount of observations based on their predictive power in the ridge regression model, and then perform PCA on that to see if we can retain the ridge regression model's performance even with a smaller set of (hopefully predictive) variables.
+
+```{r}
+ridge_coef <- do.call(rbind, lapply(ridge_models, function(model) return(extract.coef(model)[-1,])))
+ridge_coef$Value <- abs(ridge_coef$Value)
+ridge_coef <- ridge_coef[order(-ridge_coef$Value),]
+top_ridge_genes <- unique(ridge_coef[1:nrow(X_train),"Coefficient"])
+length(top_ridge_genes)
+```
+
+That leaves us with about 60 variables to work with. Before attempting PCA, let's just see how well the model performs with just these genes.
+
+```{r}
+reduced_ridge_models <- lapply(types, function(type) {
+  y_train_type <- ifelse(y_train == type, 1, 0)
+  model <- cv.glmnet(X_train[,top_ridge_genes], y_train_type, family=binomial, alpha=0)
+  return(model)
+})
+```
+
+```{r}
+reduced_ridge_ova_y_pred <- as.data.frame(predict(reduced_ridge_models, X_val[,top_ridge_genes], type="response"))
+colnames(reduced_ridge_ova_y_pred) <- types
+reduced_ridge_roc <- multiclass.roc(as.factor(y_val), reduced_ridge_ova_y_pred)
+auc(reduced_ridge_roc)
+```
+
+Ok that really hindered our model's performance. No amount of PCA on this data will provide any useful insight or ability to reduce variables further.
+
+The natural next step is to use some mixture of ridge and lasso regression (elasticnet) so that we can get the better performance of ridge regression, but end up with less variables needed. There are many values of alpha we can try, as alpha can vary between 0 and 1. Due to the time it takes to train the model, we will settle on 11 different values of alpha, from 0 to 1 in increments of 0.1 (keeping in mind we already have tried alpha of 0 and 1).
+
+```{r}
+elastic_models <- lapply(seq(0.1, 0.9, 0.1), function(alpha) {
+  models <- lapply(types, function(type) {
+    y_train_type <- ifelse(y_train == type, 1, 0)
+    model <- cv.glmnet(X_train, y_train_type, family=binomial, alpha=alpha)
+    return(model)
+  })
+  
+  return(models)
+})
+
+elastic_models <- c(list(ridge_models), elastic_models, list(baseline_models))
+```
+
+```{r, rows.print=11}
+log_models_results <- t(sapply(1:11, function(i) {
+  alpha <- seq(0, 1, 0.1)[i]
+  models <- elastic_models[[i]]
+  ova_y_pred <- as.data.frame(predict(models, X_val, type="response"))
+  colnames(ova_y_pred) <- types
+  roc <- multiclass.roc(as.factor(y_val), ova_y_pred)
+  auc <- auc(roc)
+  non_zero_coefs <- unique(do.call(c, lapply(models, function(model) {
+    coefs <- coef(model, s="lambda.min")
+    variables <- rownames(coefs)[coefs[,1] != 0]
+    return(variables[-1])
+  })))
+
+  return(c(alpha, auc, length(non_zero_coefs)))
+}))
+
+colnames(log_models_results) <- c("Alpha", "AUC", "Non-zero coefficients")
+save(log_models_results, file="../reports/figures/log_models_results.Rda")
+data.frame(log_models_results)
+```
+
+Interesting. The AUC is near identical (near perfect if not perfect) for all alpha. It generally performs better the close it is to pure ridge regression, but the drop off in performance is not worth it when it comes to being able to have a simpler model. It appears even having a little bit of ridge regression improves performance significantly. Therefore we should select an alpha of 0.9 to maximize the AUC while keeping the number of coefficients as low as possible.
+
+```{r}
+best_log_models <- elastic_models[[11]]
+best_log_models_coefs <- unique(do.call(c, lapply(best_log_models, function(model) {
+  coefs <- coef(model, s="lambda.min")
+  variables <- rownames(coefs)[coefs[,1] != 0]
+  return(variables[-1])
+})))
+
+length(best_log_models_coefs)
+```
+
+# Other models
+
+The focus of this project is on logistic regression, and we've ended up with a pretty good model. But we want to try a couple of other models to compare against, and have a chance to practice some of the other techniques we've learned. With these models, we'll use the coefficients identified from the best model found previously to shorten training time; those are the best coefficients anwyays. Let's start with linear discriminant analysis.
+
+```{r}
+lda_model <- lda(X_train[,best_log_models_coefs], y_train)
+lda_y_pred <- predict(lda_model, X_val[,best_log_models_coefs], type="response")
+lda_roc <- multiclass.roc(as.factor(y_val), lda_y_pred$posterior)
+auc(lda_roc)
+```
+
+Well that works rather well; how does nearest neighbors perform?
+
+```{r, message=FALSE}
+knn_cv_aucs <- unlist(lapply(1:50, function(k) {
+  y_pred <- knn.cv(X_train[,best_log_models_coefs], y_train, k)
+  knn_auc <- multiclass.roc(as.factor(y_train), as.numeric(y_pred))$auc
+  return(knn_auc)
+}))
+
+best_ks <- which(knn_cv_aucs == max(knn_cv_aucs))
+best_ks
+```
+
+```{r}
+knn_cv_plot <- qplot(1:50, knn_cv_aucs) +
+  geom_line() +
+  ggtitle("KNN Cross-Validation") +
+  xlab("k") +
+  ylab("AUC")
+
+ggsave("../reports/figures/knn_cross_validation.png", knn_cv_plot, width=6, height=4)
+knn_cv_plot
+```
+
+```{r, message=FALSE}
+knn_y_pred <- knn(X_train[,best_log_models_coefs], X_val[,best_log_models_coefs], y_train, k=best_ks[1])
+knn_roc <- multiclass.roc(as.factor(y_val), as.numeric(knn_y_pred))
+auc(knn_roc)
+```
+
+Not too shabby, but definitely performs the worst out of all the 3 models we've tried so far.
+
+# Testing
+
+With that in mind, let's do a final test on both our logistic regression and linear discriminant analysis models. We'll train the model with both the original training data as well as the validation data.
+
+```{r}
+X_final_train <- rbind(X_train, X_val)
+y_final_train <- c(y_train, y_val)
+```
+
+```{r}
+final_log_models <- lapply(types, function(type) {
+  y_train_type <- ifelse(y_final_train == type, 1, 0)
+  model <- cv.glmnet(X_final_train, y_train_type, family=binomial)
+  return(model)
+})
+
+final_log_models_coefs <- unique(do.call(c, lapply(final_log_models, function(model) {
+  coefs <- coef(model, s="lambda.min")
+  variables <- rownames(coefs)[coefs[,1] != 0]
+  return(variables[-1])
+})))
+```
+
+```{r}
+final_log_ova_y_pred <- as.data.frame(predict(final_log_models, X_test, type="response"))
+colnames(final_log_ova_y_pred) <- types
+final_log_roc <- multiclass.roc(as.factor(y_test), final_log_ova_y_pred)
+auc(final_log_roc)
+```
+
+```{r}
+final_lda_model <- lda(X_final_train[,final_log_models_coefs], y_final_train)
+final_lda_y_pred <- predict(final_lda_model, X_test[,final_log_models_coefs], type="response")
+final_lda_roc <- multiclass.roc(as.factor(y_test), final_lda_y_pred$posterior)
+auc(final_lda_roc)
+```
+
+Looks like our logistic regression model with lasso regression wins out in the end on the test data. For comparison, let's see what the accuracy is, as the lab that generated the data have their own accuracy scores.
+
+```{r}
+cm <- confusionMatrix(as.factor(y_test), as.factor(colnames(final_log_ova_y_pred)[max.col(final_log_ova_y_pred, "first")]))
+cm
+```
+
+```{r}
+cm_plot <- ggplot(as.data.frame(cm$table), aes(Prediction,sort(Reference, decreasing=T), fill=Freq)) +
+  geom_tile() + geom_text(aes(label=Freq)) +
+  scale_fill_gradient(low="white", high="#009194") +
+  labs(x="Reference", y="Prediction") +
+  scale_x_discrete(labels=c("ependymoma", "glioblastoma", "medulloblastoma", "normal", "pilocytic_astrocytoma"), guide=guide_axis(angle=45)) +
+  scale_y_discrete(labels=c("pilocytic_astrocytoma", "normal", "medulloblastoma", "glioblastoma", "ependymoma"))
+ggsave("../reports/figures/confusion_matrix.png", cm_plot, width=6, height=4)
+cm_plot
+```
+
+We get a 0.9667 accuracy, which is very good considering the best model the lab developed was a support vector machine with 0.95 accuracy. Their results are from 3-fold cross-validation.
+
+# Post hoc analysis
+
+One of the great things about lasso regression is that the variable selection it does makes it much easier for us to visualize the data post hoc. We will now make a heat map of those variables selected by our best model to see what their expression profile looks like across the different cancer types.
+
+```{r}
+png("../reports/figures/expression_heatmap.png", width=800, height=600)
+heatmap <- Heatmap(log2(as.matrix(expr[,final_log_models_coefs])), row_split=expr$type,
+                   row_title_rot=0, show_column_names=FALSE,
+                   heatmap_legend_param=list(title="Log2(counts)"))
+heatmap
+invisible(dev.off())
+heatmap
+```
+
+From just visual inspection, the cancer samples seem to have much more in common with each other than they do with the normal samples. This may provide a good avenue for identifying what genes are predictive for just the normal type, and perhaps we can perform a PCA on just those.
+
+```{r}
+normal_type <- ifelse(expr$type == "normal", 1, 0)
+normal_model <- cv.glmnet(as.matrix(expr[,-(1:2)]), normal_type, family=binomial)
+```
+
+```{r}
+normal_coefs <- extract.coef(normal_model)$Coefficient[-1]
+pca <- prcomp(expr[,normal_coefs])
+summary(pca)
+```
+
+Looks like we hit something good, with just 16 coefficients found for the normal model, the first component of PCA can explain about 67% of the variance!
+
+```{r, warning=FALSE}
+pca_plot <- autoplot(pca, data=expr, colour="type") + labs(color="Cancer type")
+ggsave("../reports/figures/pca.png", pca_plot, width=6, height=4)
+pca_plot
+```

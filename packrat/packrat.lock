@@ -19,6 +19,12 @@ Source: CRAN
 Version: 1.1-2
 Hash: c0d56cd15034f395874c870141870c25
 
+Package: ROCR
+Source: CRAN
+Version: 1.0-11
+Hash: b3977a8cb75b2b434043d6806be3589a
+Requires: gplots
+
 Package: Rcpp
 Source: CRAN
 Version: 1.0.6
@@ -33,6 +39,17 @@ Package: base64enc
 Source: CRAN
 Version: 0.1-3
 Hash: c590d29e555926af053055e23ee79efb
+
+Package: bitops
+Source: CRAN
+Version: 1.0-7
+Hash: a1c58663065ce2dec2fb066c699e2e11
+
+Package: caTools
+Source: CRAN
+Version: 1.18.2
+Hash: 3f376858610d4515d4d7cc95fb3123f7
+Requires: bitops
 
 Package: caret
 Source: CRAN
@@ -145,10 +162,21 @@ Source: CRAN
 Version: 0.2.2
 Hash: 136a04c75fb64c0ec16f69bcd1017de5
 
+Package: gplots
+Source: CRAN
+Version: 3.1.1
+Hash: 24daf5bf9e50b889dce6bd1780d4702c
+Requires: caTools, gtools
+
 Package: gtable
 Source: CRAN
 Version: 0.3.0
 Hash: a9e7b0666eb933a0cb36779240b4462e
+
+Package: gtools
+Source: CRAN
+Version: 3.8.2
+Hash: c157b036aad8f9889c810af94f9c7c6a
 
 Package: highr
 Source: CRAN
